@@ -42,7 +42,11 @@ func Iter(s *standalone_storage.StandAloneStorage, cf string) (engine_util.DBIte
 
 func cleanUpTestData(conf *config.Config) error {
 	if conf != nil {
-		return os.RemoveAll(conf.DBPath)
+		err := os.RemoveAll(conf.DBPath)
+		if err != nil {
+			return err
+		}
+		return nil
 	}
 	return nil
 }
@@ -275,6 +279,7 @@ func TestRawScanAfterRawPut1(t *testing.T) {
 
 func TestRawScanAfterRawDelete1(t *testing.T) {
 	conf := config.NewTestConfig()
+	cleanUpTestData(conf)
 	s := standalone_storage.NewStandAloneStorage(conf)
 	s.Start()
 	server := NewServer(s)
