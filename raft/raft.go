@@ -205,11 +205,12 @@ func (r *Raft) tick() {
 		r.heartbeatElapsed++
 		if r.heartbeatElapsed >= r.heartbeatTimeout {
 			r.heartbeatElapsed = 0
-			r.msgs = append(r.msgs, pb.Message{
-				MsgType: pb.MessageType_MsgBeat,
-				To:      r.id,
-				From:    r.id,
-			})
+			for k, _ := range r.votes {
+				if k == r.id {
+					continue
+				}
+				r.sendHeartbeat(k)
+			}
 		}
 	}
 	r.electionElapsed++
@@ -223,16 +224,19 @@ func (r *Raft) tick() {
 func (r *Raft) becomeFollower(term uint64, lead uint64) {
 	// Your Code Here (2A).
 	log.Debugf("[%v] become Follower\n", r.id)
+	r.cleanMessages()
 	r.State = StateFollower
 	r.Lead = lead
 	r.Term = term
 	r.electionElapsed = 0
+	r.Vote = 0
 }
 
 // becomeCandidate transform this peer's state to candidate
 func (r *Raft) becomeCandidate() {
 	// Your Code Here (2A).
 	log.Debugf("[%v] become Candidate\n", r.id)
+	r.cleanMessages()
 	resetVotes(r)
 	r.State = StateCandidate
 	r.Term += 1
@@ -264,6 +268,7 @@ func (r *Raft) becomeLeader() {
 	// Your Code Here (2A).
 	// NOTE: Leader should propose a noop entry on its term
 	log.Debugf("[%v] become Leader\n", r.id)
+	r.cleanMessages()
 	r.State = StateLeader
 	// send heartbeat
 	for id, _ := range r.votes {
@@ -292,21 +297,35 @@ func (r *Raft) Step(m pb.Message) error {
 		case pb.MessageType_MsgHup:
 			r.becomeCandidate()
 		case pb.MessageType_MsgRequestVote:
+			message := pb.Message{
+				MsgType: pb.MessageType_MsgRequestVoteResponse,
+				To:      m.From,
+				From:    r.id,
+				Term:    r.Term,
+			}
 			if m.Term > r.Term {
 				r.Term = m.Term
-				r.msgs = append(r.msgs, pb.Message{
-					MsgType: pb.MessageType_MsgRequestVoteResponse,
-					To:      m.From,
-					From:    r.id,
-					Term:    r.Term,
-					Reject:  false,
-				})
+				message.Reject = false
 				r.Vote = m.From
+			} else if m.Term == r.Term && (r.Vote == 0 || r.Vote == m.From) { // just for pass test self req
+				message.Reject = false
+				r.Vote = m.From
+			} else {
+				message.Reject = true
 			}
+			r.msgs = append(r.msgs, message)
 			log.Debugf("[%v] receive voteReq from [%v] and vote: %v\n", r.id, m.From, !m.Reject)
 		case pb.MessageType_MsgHeartbeat:
-			r.Term = m.Term
+			if m.Term > r.Term {
+				r.Vote = 0
+				r.Term = m.Term
+			}
 			r.electionElapsed = 0
+		case pb.MessageType_MsgAppend:
+			if m.Term > r.Term {
+				r.Term = m.Term
+				r.Vote = 0
+			}
 		}
 	case StateCandidate:
 		switch m.MsgType {
@@ -382,6 +401,8 @@ func (r *Raft) Step(m pb.Message) error {
 				})
 			}
 			log.Debugf("[%v] receive voteReq from [%v] and vote: %v\n", r.id, m.From, !m.Reject)
+		case pb.MessageType_MsgAppend:
+			r.becomeFollower(m.Term, m.From)
 		}
 	}
 	return nil
@@ -400,6 +421,7 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 	}
 	if m.Term > r.Term {
 		r.Term = m.Term
+		r.Vote = 0
 	}
 	r.heartbeatElapsed = 0
 }
@@ -433,4 +455,9 @@ func resetVotes(r *Raft) {
 	for k, _ := range r.votes {
 		r.votes[k] = false
 	}
+}
+
+// 转换状态后消除前一状态未执行的操作
+func (r *Raft) cleanMessages() {
+	r.msgs = make([]pb.Message, 0)
 }
