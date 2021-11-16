@@ -203,8 +203,20 @@ func (r *Raft) tick() {
 	// Your Code Here (2A).
 	if r.State == StateLeader {
 		r.heartbeatElapsed++
+		if r.heartbeatElapsed >= r.heartbeatTimeout {
+			r.heartbeatElapsed = 0
+			r.msgs = append(r.msgs, pb.Message{
+				MsgType: pb.MessageType_MsgBeat,
+				To:      r.id,
+				From:    r.id,
+			})
+		}
 	}
 	r.electionElapsed++
+	if r.electionElapsed >= r.electionTimeout {
+		r.electionElapsed = 0
+		r.becomeCandidate()
+	}
 }
 
 // becomeFollower transform this peer's state to Follower
@@ -221,6 +233,7 @@ func (r *Raft) becomeFollower(term uint64, lead uint64) {
 func (r *Raft) becomeCandidate() {
 	// Your Code Here (2A).
 	log.Debugf("[%v] become Candidate\n", r.id)
+	resetVotes(r)
 	r.State = StateCandidate
 	r.Term += 1
 	r.electionElapsed = 0
@@ -229,6 +242,10 @@ func (r *Raft) becomeCandidate() {
 		if id == r.id {
 			// vote for itself
 			r.votes[id] = true
+			checkVoteNumsHasGot(r)
+			if checkVoteNumsHasGot(r) {
+				r.becomeLeader()
+			}
 			continue
 		}
 		log.Debugf("[%v] send voteReq to [%v]\n", r.id, id)
@@ -248,14 +265,25 @@ func (r *Raft) becomeLeader() {
 	// NOTE: Leader should propose a noop entry on its term
 	log.Debugf("[%v] become Leader\n", r.id)
 	r.State = StateLeader
-	r.heartbeatElapsed = r.heartbeatTimeout
+	// send heartbeat
+	for id, _ := range r.votes {
+		if id == r.id {
+			continue
+		}
+		r.msgs = append(r.msgs, pb.Message{
+			MsgType: pb.MessageType_MsgHeartbeat,
+			To:      id,
+			From:    r.id,
+			Term:    r.Term,
+		})
+	}
 }
 
 // Step the entrance of handle message, see `MessageType`
 // on `eraftpb.proto` for what msgs should be handled  响应
 func (r *Raft) Step(m pb.Message) error {
 	// Your Code Here (2A).
-	if m.Term < r.Term {
+	if !IsLocalMsg(m.MsgType) && m.Term < r.Term {
 		return nil
 	}
 	switch r.State {
@@ -273,6 +301,7 @@ func (r *Raft) Step(m pb.Message) error {
 					Term:    r.Term,
 					Reject:  false,
 				})
+				r.Vote = m.From
 			}
 			log.Debugf("[%v] receive voteReq from [%v] and vote: %v\n", r.id, m.From, !m.Reject)
 		case pb.MessageType_MsgHeartbeat:
@@ -286,27 +315,73 @@ func (r *Raft) Step(m pb.Message) error {
 			if m.Term == r.Term {
 				r.votes[m.From] = !m.Reject
 			}
-			i := 0
-			for _, v := range r.votes {
-				if v {
-					i++
-				}
-			}
-			if i > len(r.votes)/2 {
+			checkVoteNumsHasGot(r)
+			if checkVoteNumsHasGot(r) {
 				r.becomeLeader()
 			}
 		case pb.MessageType_MsgHeartbeat:
 			r.becomeFollower(m.Term, m.From)
 		case pb.MessageType_MsgHup:
 			r.becomeCandidate()
+		case pb.MessageType_MsgRequestVote:
+			if m.Term > r.Term {
+				r.Term = m.Term
+				r.msgs = append(r.msgs, pb.Message{
+					MsgType: pb.MessageType_MsgRequestVoteResponse,
+					To:      m.From,
+					From:    r.id,
+					Term:    r.Term,
+					Reject:  false,
+				})
+				r.Vote = m.From
+				r.becomeFollower(m.Term, m.From)
+			} else { // ==
+				r.msgs = append(r.msgs, pb.Message{
+					MsgType: pb.MessageType_MsgRequestVoteResponse,
+					To:      m.From,
+					From:    r.id,
+					Term:    r.Term,
+					Reject:  true,
+				})
+			}
+			log.Debugf("[%v] receive voteReq from [%v] and vote: %v\n", r.id, m.From, !m.Reject)
+		case pb.MessageType_MsgAppend:
+			r.becomeFollower(m.Term, m.From)
 		}
 	case StateLeader:
 		switch m.MsgType {
 		case pb.MessageType_MsgBeat:
-			r.sendHeartbeat(m.To)
+			for k, _ := range r.votes {
+				if k == r.id {
+					continue
+				}
+				r.sendHeartbeat(k)
+			}
 		case pb.MessageType_MsgHeartbeatResponse:
 		case pb.MessageType_MsgHeartbeat:
 			r.becomeFollower(m.Term, m.From)
+		case pb.MessageType_MsgRequestVote:
+			if m.Term > r.Term {
+				r.Term = m.Term
+				r.msgs = append(r.msgs, pb.Message{
+					MsgType: pb.MessageType_MsgRequestVoteResponse,
+					To:      m.From,
+					From:    r.id,
+					Term:    r.Term,
+					Reject:  false,
+				})
+				r.Vote = m.From
+				r.becomeFollower(m.Term, m.From)
+			} else { // ==
+				r.msgs = append(r.msgs, pb.Message{
+					MsgType: pb.MessageType_MsgRequestVoteResponse,
+					To:      m.From,
+					From:    r.id,
+					Term:    r.Term,
+					Reject:  true,
+				})
+			}
+			log.Debugf("[%v] receive voteReq from [%v] and vote: %v\n", r.id, m.From, !m.Reject)
 		}
 	}
 	return nil
@@ -342,4 +417,20 @@ func (r *Raft) addNode(id uint64) {
 // removeNode remove a node from raft group
 func (r *Raft) removeNode(id uint64) {
 	// Your Code Here (3A).
+}
+
+func checkVoteNumsHasGot(r *Raft) bool {
+	i := 0
+	for _, v := range r.votes {
+		if v {
+			i++
+		}
+	}
+	return i > len(r.votes)/2
+}
+
+func resetVotes(r *Raft) {
+	for k, _ := range r.votes {
+		r.votes[k] = false
+	}
 }
