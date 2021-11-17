@@ -18,6 +18,7 @@ import (
 	"errors"
 	"github.com/pingcap-incubator/tinykv/log"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
+	"math/rand"
 )
 
 // None is a placeholder node ID used when there is no leader.
@@ -165,18 +166,19 @@ func newRaft(c *Config) *Raft {
 		panic(err.Error())
 	}
 	// Your Code Here (2A).
-	votes := make(map[uint64]bool)
+	prs := make(map[uint64]*Progress)
 	for _, p := range c.peers {
-		votes[p] = false
+		prs[p] = new(Progress)
 	}
 	r := &Raft{
 		id:               c.ID,
-		State:            StateFollower,
-		votes:            votes,
+		Prs:              prs,
 		msgs:             make([]pb.Message, 0),
+		Lead:             None,
 		heartbeatTimeout: c.HeartbeatTick,
 		electionTimeout:  c.ElectionTick,
 	}
+	r.becomeFollower(r.Term, None)
 	return r
 }
 
@@ -205,18 +207,18 @@ func (r *Raft) tick() {
 		r.heartbeatElapsed++
 		if r.heartbeatElapsed >= r.heartbeatTimeout {
 			r.heartbeatElapsed = 0
-			for k, _ := range r.votes {
-				if k == r.id {
-					continue
-				}
-				r.sendHeartbeat(k)
+			if err := r.Step(pb.Message{MsgType: pb.MessageType_MsgBeat}); err != nil {
+				log.Error(err)
 			}
 		}
-	}
-	r.electionElapsed++
-	if r.electionElapsed >= r.electionTimeout {
-		r.electionElapsed = 0
-		r.becomeCandidate()
+	} else { // StateFollower StateCandidate
+		r.electionElapsed++
+		if r.electionElapsed > r.getRandomElectionTimeout() {
+			r.electionElapsed = 0
+			if err := r.Step(pb.Message{MsgType: pb.MessageType_MsgHup}); err != nil {
+				log.Error(err)
+			}
+		}
 	}
 }
 
@@ -237,30 +239,10 @@ func (r *Raft) becomeCandidate() {
 	// Your Code Here (2A).
 	log.Debugf("[%v] become Candidate\n", r.id)
 	r.cleanMessages()
-	resetVotes(r)
+	r.resetVotes()
 	r.State = StateCandidate
 	r.Term += 1
 	r.electionElapsed = 0
-
-	for id, _ := range r.votes {
-		if id == r.id {
-			// vote for itself
-			r.votes[id] = true
-			checkVoteNumsHasGot(r)
-			if checkVoteNumsHasGot(r) {
-				r.becomeLeader()
-			}
-			continue
-		}
-		log.Debugf("[%v] send voteReq to [%v]\n", r.id, id)
-		r.msgs = append(r.msgs, pb.Message{
-			MsgType: pb.MessageType_MsgRequestVote,
-			To:      id,
-			From:    r.id,
-			Term:    r.Term,
-		})
-	}
-
 }
 
 // becomeLeader transform this peer's state to leader
@@ -271,16 +253,8 @@ func (r *Raft) becomeLeader() {
 	r.cleanMessages()
 	r.State = StateLeader
 	// send heartbeat
-	for id, _ := range r.votes {
-		if id == r.id {
-			continue
-		}
-		r.msgs = append(r.msgs, pb.Message{
-			MsgType: pb.MessageType_MsgHeartbeat,
-			To:      id,
-			From:    r.id,
-			Term:    r.Term,
-		})
+	if err := r.Step(pb.Message{MsgType: pb.MessageType_MsgBeat}); err != nil {
+		log.Error(err)
 	}
 }
 
@@ -293,117 +267,11 @@ func (r *Raft) Step(m pb.Message) error {
 	}
 	switch r.State {
 	case StateFollower:
-		switch m.MsgType {
-		case pb.MessageType_MsgHup:
-			r.becomeCandidate()
-		case pb.MessageType_MsgRequestVote:
-			message := pb.Message{
-				MsgType: pb.MessageType_MsgRequestVoteResponse,
-				To:      m.From,
-				From:    r.id,
-				Term:    r.Term,
-			}
-			if m.Term > r.Term {
-				r.Term = m.Term
-				message.Reject = false
-				r.Vote = m.From
-			} else if m.Term == r.Term && (r.Vote == 0 || r.Vote == m.From) { // just for pass test self req
-				message.Reject = false
-				r.Vote = m.From
-			} else {
-				message.Reject = true
-			}
-			r.msgs = append(r.msgs, message)
-			log.Debugf("[%v] receive voteReq from [%v] and vote: %v\n", r.id, m.From, !m.Reject)
-		case pb.MessageType_MsgHeartbeat:
-			if m.Term > r.Term {
-				r.Vote = 0
-				r.Term = m.Term
-			}
-			r.electionElapsed = 0
-		case pb.MessageType_MsgAppend:
-			if m.Term > r.Term {
-				r.Term = m.Term
-				r.Vote = 0
-			}
-		}
+		return r.StepFollower(m)
 	case StateCandidate:
-		switch m.MsgType {
-		case pb.MessageType_MsgRequestVoteResponse:
-			log.Debugf("[%v] receive voteResponse from [%v] vote: %v\n", r.id, m.From, !m.Reject)
-			if m.Term == r.Term {
-				r.votes[m.From] = !m.Reject
-			}
-			checkVoteNumsHasGot(r)
-			if checkVoteNumsHasGot(r) {
-				r.becomeLeader()
-			}
-		case pb.MessageType_MsgHeartbeat:
-			r.becomeFollower(m.Term, m.From)
-		case pb.MessageType_MsgHup:
-			r.becomeCandidate()
-		case pb.MessageType_MsgRequestVote:
-			if m.Term > r.Term {
-				r.Term = m.Term
-				r.msgs = append(r.msgs, pb.Message{
-					MsgType: pb.MessageType_MsgRequestVoteResponse,
-					To:      m.From,
-					From:    r.id,
-					Term:    r.Term,
-					Reject:  false,
-				})
-				r.Vote = m.From
-				r.becomeFollower(m.Term, m.From)
-			} else { // ==
-				r.msgs = append(r.msgs, pb.Message{
-					MsgType: pb.MessageType_MsgRequestVoteResponse,
-					To:      m.From,
-					From:    r.id,
-					Term:    r.Term,
-					Reject:  true,
-				})
-			}
-			log.Debugf("[%v] receive voteReq from [%v] and vote: %v\n", r.id, m.From, !m.Reject)
-		case pb.MessageType_MsgAppend:
-			r.becomeFollower(m.Term, m.From)
-		}
+		return r.StepCandidate(m)
 	case StateLeader:
-		switch m.MsgType {
-		case pb.MessageType_MsgBeat:
-			for k, _ := range r.votes {
-				if k == r.id {
-					continue
-				}
-				r.sendHeartbeat(k)
-			}
-		case pb.MessageType_MsgHeartbeatResponse:
-		case pb.MessageType_MsgHeartbeat:
-			r.becomeFollower(m.Term, m.From)
-		case pb.MessageType_MsgRequestVote:
-			if m.Term > r.Term {
-				r.Term = m.Term
-				r.msgs = append(r.msgs, pb.Message{
-					MsgType: pb.MessageType_MsgRequestVoteResponse,
-					To:      m.From,
-					From:    r.id,
-					Term:    r.Term,
-					Reject:  false,
-				})
-				r.Vote = m.From
-				r.becomeFollower(m.Term, m.From)
-			} else { // ==
-				r.msgs = append(r.msgs, pb.Message{
-					MsgType: pb.MessageType_MsgRequestVoteResponse,
-					To:      m.From,
-					From:    r.id,
-					Term:    r.Term,
-					Reject:  true,
-				})
-			}
-			log.Debugf("[%v] receive voteReq from [%v] and vote: %v\n", r.id, m.From, !m.Reject)
-		case pb.MessageType_MsgAppend:
-			r.becomeFollower(m.Term, m.From)
-		}
+		return r.StepLeader(m)
 	}
 	return nil
 }
@@ -448,16 +316,178 @@ func checkVoteNumsHasGot(r *Raft) bool {
 			i++
 		}
 	}
-	return i > len(r.votes)/2
+	return i > len(r.Prs)/2
 }
 
-func resetVotes(r *Raft) {
-	for k, _ := range r.votes {
-		r.votes[k] = false
-	}
+func (r *Raft) resetVotes() {
+	r.votes = make(map[uint64]bool)
 }
 
 // 转换状态后消除前一状态未执行的操作
 func (r *Raft) cleanMessages() {
 	r.msgs = make([]pb.Message, 0)
+}
+
+// reset一系列操作
+func (r *Raft) reset(term uint64) {
+	if term != r.Term {
+		r.Term = term
+		r.Vote = None
+	}
+	r.electionElapsed = 0
+	r.heartbeatElapsed = 0
+	r.cleanMessages()
+	r.resetVotes()
+}
+
+func (r *Raft) getRandomElectionTimeout() int {
+	return r.electionTimeout + rand.Intn(r.electionTimeout)
+}
+
+func (r *Raft) StepFollower(m pb.Message) error {
+	switch m.MsgType {
+	case pb.MessageType_MsgHup:
+		r.becomeCandidate()
+		// send votes
+		r.broadcastVotes()
+	case pb.MessageType_MsgRequestVote:
+		message := pb.Message{
+			MsgType: pb.MessageType_MsgRequestVoteResponse,
+			To:      m.From,
+			From:    r.id,
+			Term:    r.Term,
+		}
+		if m.Term > r.Term {
+			r.Term = m.Term
+			message.Reject = false
+			r.Vote = m.From
+		} else if m.Term == r.Term && (r.Vote == 0 || r.Vote == m.From) { // just for pass test self req
+			message.Reject = false
+			r.Vote = m.From
+		} else {
+			message.Reject = true
+		}
+		r.msgs = append(r.msgs, message)
+		log.Debugf("[%v] receive voteReq from [%v] and vote: %v\n", r.id, m.From, !m.Reject)
+	case pb.MessageType_MsgHeartbeat:
+		if m.Term > r.Term {
+			r.Vote = 0
+			r.Term = m.Term
+		}
+		r.electionElapsed = 0
+	case pb.MessageType_MsgAppend:
+		if m.Term > r.Term {
+			r.Term = m.Term
+			r.Vote = 0
+		}
+	}
+
+	return nil
+}
+
+func (r *Raft) StepCandidate(m pb.Message) error {
+	switch m.MsgType {
+	case pb.MessageType_MsgHup:
+		// restart a new election
+		r.reset(r.Term + 1)
+		// send votes
+		r.broadcastVotes()
+	case pb.MessageType_MsgRequestVoteResponse:
+		log.Debugf("[%v] receive voteResponse from [%v] vote: %v\n", r.id, m.From, !m.Reject)
+		if m.Term == r.Term {
+			r.votes[m.From] = !m.Reject
+		}
+		checkVoteNumsHasGot(r)
+		if checkVoteNumsHasGot(r) {
+			r.becomeLeader()
+		}
+	case pb.MessageType_MsgHeartbeat:
+		r.becomeFollower(m.Term, m.From)
+	case pb.MessageType_MsgRequestVote:
+		if m.Term > r.Term {
+			r.Term = m.Term
+			r.msgs = append(r.msgs, pb.Message{
+				MsgType: pb.MessageType_MsgRequestVoteResponse,
+				To:      m.From,
+				From:    r.id,
+				Term:    r.Term,
+				Reject:  false,
+			})
+			r.Vote = m.From
+			r.becomeFollower(m.Term, m.From)
+		} else { // ==
+			r.msgs = append(r.msgs, pb.Message{
+				MsgType: pb.MessageType_MsgRequestVoteResponse,
+				To:      m.From,
+				From:    r.id,
+				Term:    r.Term,
+				Reject:  true,
+			})
+		}
+		log.Debugf("[%v] receive voteReq from [%v] and vote: %v\n", r.id, m.From, !m.Reject)
+	case pb.MessageType_MsgAppend:
+		r.becomeFollower(m.Term, m.From)
+	}
+	return nil
+}
+
+func (r *Raft) StepLeader(m pb.Message) error {
+	switch m.MsgType {
+	case pb.MessageType_MsgBeat:
+		for follower, _ := range r.Prs {
+			if follower == r.id {
+				continue
+			}
+			r.sendHeartbeat(follower)
+		}
+	case pb.MessageType_MsgHeartbeatResponse:
+	case pb.MessageType_MsgHeartbeat:
+		r.becomeFollower(m.Term, m.From)
+	case pb.MessageType_MsgRequestVote:
+		if m.Term > r.Term {
+			r.Term = m.Term
+			r.msgs = append(r.msgs, pb.Message{
+				MsgType: pb.MessageType_MsgRequestVoteResponse,
+				To:      m.From,
+				From:    r.id,
+				Term:    r.Term,
+				Reject:  false,
+			})
+			r.Vote = m.From
+			r.becomeFollower(m.Term, m.From)
+		} else { // ==
+			r.msgs = append(r.msgs, pb.Message{
+				MsgType: pb.MessageType_MsgRequestVoteResponse,
+				To:      m.From,
+				From:    r.id,
+				Term:    r.Term,
+				Reject:  true,
+			})
+		}
+		log.Debugf("[%v] receive voteReq from [%v] and vote: %v\n", r.id, m.From, !m.Reject)
+	case pb.MessageType_MsgAppend:
+		r.becomeFollower(m.Term, m.From)
+	}
+	return nil
+}
+
+func (r *Raft) broadcastVotes() {
+	for follower, _ := range r.Prs {
+		if follower == r.id {
+			// vote for itself
+			r.votes[r.id] = true
+			checkVoteNumsHasGot(r)
+			if checkVoteNumsHasGot(r) {
+				r.becomeLeader()
+			}
+			continue
+		}
+		log.Debugf("[%v] send voteReq to [%v]\n", r.id, follower)
+		r.msgs = append(r.msgs, pb.Message{
+			MsgType: pb.MessageType_MsgRequestVote,
+			To:      follower,
+			From:    r.id,
+			Term:    r.Term,
+		})
+	}
 }
