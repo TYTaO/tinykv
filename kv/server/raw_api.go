@@ -12,7 +12,7 @@ import (
 // RawGet return the corresponding Get response based on RawGetRequest's CF and Key fields
 func (server *Server) RawGet(_ context.Context, req *kvrpcpb.RawGetRequest) (*kvrpcpb.RawGetResponse, error) {
 	// Your Code Here (1).
-	reader, err := server.storage.Reader(nil)
+	reader, err := server.storage.Reader(req.Context)
 	if err != nil {
 		return nil, err
 	}
@@ -62,15 +62,15 @@ func (server *Server) RawDelete(_ context.Context, req *kvrpcpb.RawDeleteRequest
 func (server *Server) RawScan(_ context.Context, req *kvrpcpb.RawScanRequest) (*kvrpcpb.RawScanResponse, error) {
 	// Your Code Here (1).
 	// Hint: Consider using reader.IterCF
-	reader, err := server.storage.Reader(nil)
+	reader, err := server.storage.Reader(req.Context)
 	if err != nil {
 		return nil, err
 	}
 	cf := reader.IterCF(req.Cf)
 	cf.Seek(req.StartKey)
 	var kvs []*kvrpcpb.KvPair
-	i := uint32(0)
-	for cf.Valid() && i < req.Limit {
+
+	for i := uint32(0); cf.Valid() && i < req.Limit; i++ {
 		item := cf.Item()
 		value, err := item.Value()
 		if err != nil {
@@ -78,7 +78,6 @@ func (server *Server) RawScan(_ context.Context, req *kvrpcpb.RawScanRequest) (*
 		}
 		kvs = append(kvs, &kvrpcpb.KvPair{Key: item.Key(), Value: value})
 		cf.Next()
-		i++
 	}
 	return &kvrpcpb.RawScanResponse{Kvs: kvs}, nil
 }
