@@ -123,7 +123,7 @@ func (r *Raft) stepStateLeader(m pb.Message) error {
 
 	// 'MessageType_MsgPropose' is a local message that proposes to append data to the leader's log entries.
 	case pb.MessageType_MsgPropose:
-		r.handlePropose(m)
+		//r.handlePropose(m)
 
 	// 'MessageType_MsgAppend' contains log entries to replicate.
 	case pb.MessageType_MsgAppend:
@@ -131,7 +131,6 @@ func (r *Raft) stepStateLeader(m pb.Message) error {
 
 	// 'MessageType_MsgAppendResponse' is response to log replication request('MessageType_MsgAppend').
 	case pb.MessageType_MsgAppendResponse:
-		r.handleAppendResponse()
 
 	// 'MessageType_MsgRequestVote' requests votes for election.
 	case pb.MessageType_MsgRequestVote:
@@ -150,11 +149,10 @@ func (r *Raft) stepStateLeader(m pb.Message) error {
 
 	// 'MessageType_MsgHeartbeatResponse' is a response to 'MessageType_MsgHeartbeat'.
 	case pb.MessageType_MsgHeartbeatResponse:
-		r.handleHeartbeat(m)
 
 	// 'MessageType_MsgTransferLeader' requests the leader to transfer its leadership.
 	case pb.MessageType_MsgTransferLeader:
-		r.handleHeartbeatResponse(m)
+
 	// 'MessageType_MsgTimeoutNow' send from the leader to the leadership transfer target, to let
 	// the transfer target timeout immediately and start a new election.
 	case pb.MessageType_MsgTimeoutNow:
