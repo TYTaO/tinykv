@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"github.com/pingcap-incubator/tinykv/log"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
 
@@ -166,24 +167,25 @@ func (r *Raft) stepStateLeader(m pb.Message) error {
 func (r *Raft) handleStartNewElection() {
 	// Code Here.
 	r.becomeCandidate()
+	r.heartbeatElapsed = 0
 
-	if len(r.Prs) == 1 {
+	if len(r.votes) == 1 {
 		r.becomeLeader()
-		return
 	}
 
-	// send request vote to other peers.
-	for peer := range r.Prs {
-		if peer != r.id {
-			r.msgs = append(r.msgs, pb.Message{
-				MsgType: pb.MessageType_MsgRequestVote,
-				To:      peer,
-				From:    r.id,
-				Term:    r.Term,
-			})
+	for id, _ := range r.votes {
+		if id == r.id {
+			continue
 		}
+		log.Debugf("[%v] send voteReq to [%v]\n", r.id, id)
+		//r.votes[id] = true
+		r.msgs = append(r.msgs, pb.Message{
+			MsgType: pb.MessageType_MsgRequestVote,
+			To:      id,
+			From:    r.id,
+			Term:    r.Term,
+		})
 	}
-
 }
 
 // handleRequestVote handle requests votes for election.
@@ -204,9 +206,26 @@ func (r *Raft) handleRequestVote(m pb.Message) {
 		return
 	}
 
-	// Current node is outdated
+	// Current Node is outdated.
 	if m.Term > r.Term {
 		r.becomeFollower(m.Term, None)
+		r.Vote = m.From
+
+		r.msgs = append(r.msgs, pb.Message{
+			MsgType: pb.MessageType_MsgRequestVoteResponse,
+			To:      m.From,
+			From:    r.id,
+			Term:    r.Term,
+			Reject:  false,
+		})
+		return
+	}
+
+	// r.Term == m. Term
+	// Vote error node
+	if r.Vote != None && r.Vote != m.From {
+		r.msgs = append(r.msgs, msgRefuse)
+		return
 	}
 
 	// Send vote.
@@ -237,14 +256,11 @@ func (r *Raft) handleRequestVoteResponse(m pb.Message) {
 
 	// Update votes.
 	r.votes[m.From] = !m.Reject
-	accept, refuse := 0, 0
+	accept := 0
 	for peer, _ := range r.votes {
 		if r.votes[peer] {
 			accept++
-		} else {
-			refuse++
 		}
-
 		// Most accept or refuse.
 		if accept > len(r.votes)/2 {
 			r.becomeLeader()
@@ -256,11 +272,11 @@ func (r *Raft) handleRequestVoteResponse(m pb.Message) {
 // handleSendHeatBeat handle the leader to send a heartbeat.
 func (r *Raft) handleSendHeatBeat() {
 	// Code Here.
-
+	r.becomeLeader()
 	// Send heartbeat to other nodes.
-	for peer := range r.Prs {
-		if peer != r.id {
-			r.sendHeartbeat(peer)
+	for id, _ := range r.votes {
+		if id != r.id {
+			r.sendHeartbeat(id)
 		}
 	}
 }

@@ -18,6 +18,7 @@ import (
 	"errors"
 	"github.com/pingcap-incubator/tinykv/log"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
+	"math/rand"
 )
 
 // None is a placeholder node ID used when there is no leader.
@@ -143,6 +144,9 @@ type Raft struct {
 	// valid message from current leader when it is a follower.
 	electionElapsed int
 
+	// randomElectionElapsed
+	randomElectionElapsed int
+
 	// leadTransferee is id of the leader transfer target when its value is not zero.
 	// Follow the procedure defined in section 3.10 of Raft phd thesis.
 	// (https://web.stanford.edu/~ouster/cgi-bin/papers/OngaroPhD.pdf)
@@ -205,27 +209,35 @@ func (r *Raft) tick() {
 
 	switch r.State {
 	case StateFollower:
-		if r.electionElapsed >= r.electionTimeout {
-			err := r.Step(pb.Message{MsgType: pb.MessageType_MsgHup})
-			if err != nil {
-				panic(err)
+		r.electionElapsed++
+		//fmt.Printf("electionElapsed: %v, electionTimeout: %v\n", r.electionElapsed, r.electionTimeout)
+		if r.electionElapsed >= r.randomElectionElapsed {
+			r.electionElapsed = 0
+			if err := r.Step(pb.Message{MsgType: pb.MessageType_MsgHup}); err != nil {
+				panic(err.Error())
 			}
 		}
 	case StateCandidate:
-		if r.electionElapsed >= r.electionTimeout {
-			err := r.Step(pb.Message{MsgType: pb.MessageType_MsgHup})
-			if err != nil {
-				panic(err)
+		r.electionElapsed++
+		if r.electionElapsed >= r.randomElectionElapsed {
+			r.electionElapsed = 0
+			if err := r.Step(pb.Message{MsgType: pb.MessageType_MsgHup}); err != nil {
+				panic(err.Error())
 			}
 		}
 	case StateLeader:
 		r.heartbeatElapsed++
+		if r.heartbeatElapsed >= r.heartbeatTimeout {
+			r.heartbeatElapsed = 0
+			if err := r.Step(pb.Message{MsgType: pb.MessageType_MsgBeat}); err != nil {
+				panic(err.Error())
+			}
+		}
 	}
 
 	//if r.State == StateLeader {
 	//	r.heartbeatElapsed++
 	//}
-	r.electionElapsed++
 }
 
 // becomeFollower transform this peer's state to Follower
@@ -235,8 +247,8 @@ func (r *Raft) becomeFollower(term uint64, lead uint64) {
 	r.State = StateFollower
 	r.Lead = lead
 	r.Term = term
-	r.Vote = lead
 	r.electionElapsed = 0
+	r.randomElectionElapsed = r.electionTimeout + rand.Intn(r.electionTimeout)
 }
 
 // becomeCandidate transform this peer's state to candidate
@@ -246,22 +258,9 @@ func (r *Raft) becomeCandidate() {
 	r.State = StateCandidate
 	r.Term += 1
 	r.electionElapsed = 0
-
-	for id, _ := range r.votes {
-		if id == r.id {
-			// vote for itself
-			r.votes[id] = true
-			continue
-		}
-		log.Debugf("[%v] send voteReq to [%v]\n", r.id, id)
-		r.votes[id] = false
-		r.msgs = append(r.msgs, pb.Message{
-			MsgType: pb.MessageType_MsgRequestVote,
-			To:      id,
-			From:    r.id,
-			Term:    r.Term,
-		})
-	}
+	r.randomElectionElapsed = r.electionTimeout + rand.Intn(r.electionTimeout)
+	// vote for itself
+	r.votes[r.id] = true
 
 }
 
@@ -271,7 +270,8 @@ func (r *Raft) becomeLeader() {
 	// NOTE: Leader should propose a noop entry on its term
 	log.Debugf("[%v] become Leader\n", r.id)
 	r.State = StateLeader
-	r.heartbeatElapsed = r.heartbeatTimeout
+	r.Lead = r.id
+	r.heartbeatElapsed = 0
 }
 
 // Step the entrance of handle message, see `MessageType`
@@ -314,60 +314,6 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 		return
 	}
 	r.becomeFollower(m.Term, m.From)
-
-	/*
-			// Doesn't contain an entry at prevLogIndex whose term matches prevLogTerm
-			preLogTerm, err := r.RaftLog.Term(m.Index)
-			if err != nil || preLogTerm != m.LogTerm {
-				r.msgs = append(r.msgs, rejectMsg)
-				return
-			}
-
-			// Same index but different terms.
-			lastIndex := r.RaftLog.LastIndex()
-			current_index := 0
-			for index, entry := range m.Entries {
-				if entry.Index > lastIndex {
-					current_index = index
-					break
-				}
-
-				term, err := r.RaftLog.Term(entry.Index)
-				if err != nil {
-					return
-				}
-				// delete logs
-				if term != entry.Term {
-					r.RaftLog.stabled = min(r.RaftLog.stabled, entry.Index-1)
-					r.RaftLog.entries = r.RaftLog.entries[:entry.Index-r.RaftLog.first]
-					break
-				}
-				current_index = index
-			}
-
-			// Append logs.
-			if len(m.Entries) > 0 && m.Entries[current_index].Index > r.RaftLog.LastIndex() {
-				for _, entry := range m.Entries[current_index:] {
-					r.RaftLog.entries = append(r.RaftLog.entries, pb.Entry{
-						EntryType: entry.EntryType,
-						Term:      entry.Term,
-						Index:     entry.Index,
-						Data:      entry.Data,
-					})
-				}
-			}
-
-		 	fmt.Println(m.Commit, r.RaftLog.committed)
-
-			// leaderCommit > commitIndex
-			if m.Commit > r.RaftLog.committed {
-				lastIndex = m.Index
-				if len(m.Entries) > 0 {
-					lastIndex = m.Entries[len(m.Entries)-1].Index
-				}
-				r.RaftLog.committed = min(m.Commit, lastIndex)
-			}
-	*/
 
 	// Accept
 	r.msgs = append(r.msgs, pb.Message{
