@@ -83,6 +83,13 @@ func (l *RaftLog) maybeCompact() {
 	// Your Code Here (2C).
 }
 
+// committedEntries return all the committed entries
+func (l *RaftLog) committedEntries() []pb.Entry {
+	// Your Code Here (2A).
+	entries := l.entries[l.applied:l.committed]
+	return entries
+}
+
 // unstableEntries return all the unstable entries
 func (l *RaftLog) unstableEntries() []pb.Entry {
 	// Your Code Here (2A).
