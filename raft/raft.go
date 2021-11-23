@@ -190,7 +190,14 @@ func newRaft(c *Config) *Raft {
 	for _, p := range c.peers {
 		prs[p] = new(Progress)
 	}
-	raftLog := newLog(new(MemoryStorage))
+	raftLog := newLog(c.Storage)
+	ms := c.Storage.(*MemoryStorage)
+	state, _, err := ms.InitialState()
+	if err != nil {
+		log.Error(err)
+		return nil
+	}
+	raftLog.committed = state.Commit
 	r := &Raft{
 		id:               c.ID,
 		Prs:              prs,
@@ -199,6 +206,8 @@ func newRaft(c *Config) *Raft {
 		heartbeatTimeout: c.HeartbeatTick,
 		electionTimeout:  c.ElectionTick,
 		RaftLog:          raftLog,
+		Term:             state.Term,
+		Vote:             state.Vote,
 	}
 	r.becomeFollower(r.Term, None)
 	return r
@@ -209,17 +218,24 @@ func newRaft(c *Config) *Raft {
 func (r *Raft) sendAppend(to uint64) bool {
 	// Your Code Here (2A).
 	sendEntries := make([]*pb.Entry, 0)
-	for _, e := range r.RaftLog.entries {
-		sendEntries = append(sendEntries, &e)
+	for i, _ := range r.RaftLog.entries[r.Prs[to].Match:] {
+		sendEntries = append(sendEntries, &(r.RaftLog.entries[int(r.Prs[to].Match)+i])) // * r.Prs[to].Match+
+	}
+	logTerm, err := r.RaftLog.Term(r.Prs[to].Match)
+	if err != nil {
+		log.Error(err)
 	}
 	r.msgs = append(r.msgs, pb.Message{
 		MsgType: pb.MessageType_MsgAppend,
 		To:      to,
 		From:    r.id,
 		Term:    r.Term,
+		LogTerm: logTerm,
+		Index:   r.Prs[to].Match,
 		Commit:  r.RaftLog.committed,
 		Entries: sendEntries,
 	})
+	log.Debugf("[%v] -> [%v] sendAppend entries: %v", r.id, to, sendEntries)
 	return true
 }
 
@@ -341,6 +357,7 @@ func (r *Raft) StepFollower(m pb.Message) error {
 	case pb.MessageType_MsgHeartbeat:
 		r.handleHeartbeat(m)
 	case pb.MessageType_MsgAppend:
+		r.becomeFollower(m.Term, m.From)
 		r.handleAppendEntries(m)
 	}
 	return nil
@@ -369,12 +386,14 @@ func (r *Raft) StepCandidate(m pb.Message) error {
 
 func (r *Raft) StepLeader(m pb.Message) error {
 	switch m.MsgType {
+	case pb.MessageType_MsgAppendResponse:
+		r.handleAppendResponse(m)
 	case pb.MessageType_MsgPropose:
 		r.handlePropose(m)
 	case pb.MessageType_MsgBeat:
 		r.handleBeat(m)
 	case pb.MessageType_MsgHeartbeatResponse:
-
+		r.handleHeartbeatResponse(m)
 	case pb.MessageType_MsgHeartbeat:
 		r.becomeFollower(m.Term, m.From)
 		r.handleHeartbeat(m)

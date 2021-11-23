@@ -14,7 +14,10 @@
 
 package raft
 
-import pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
+import (
+	"errors"
+	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
+)
 
 // RaftLog manage the log entries, its struct look like:
 //
@@ -58,11 +61,18 @@ type RaftLog struct {
 // to the state that it just commits and applies the latest snapshot.
 func newLog(storage Storage) *RaftLog {
 	// Your Code Here (2A).
+	//entries := storage.(*MemoryStorage).ents
 	entries := make([]pb.Entry, 0)
+	// append storage log to raftlog todo
+	ms := storage.(*MemoryStorage)
+	for _, e := range ms.ents[ms.firstIndex():] {
+		entries = append(entries, e)
+	}
 	return &RaftLog{
 		storage:             storage,
 		entries:             entries,
 		recordAppendRespNum: map[int]int{},
+		stabled:             uint64(ms.lastIndex()),
 	}
 }
 
@@ -76,13 +86,14 @@ func (l *RaftLog) maybeCompact() {
 // unstableEntries return all the unstable entries
 func (l *RaftLog) unstableEntries() []pb.Entry {
 	// Your Code Here (2A).
-	return nil
+	entries := l.entries[l.stabled:]
+	return entries
 }
 
 // nextEnts returns all the committed but not applied entries
 func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 	// Your Code Here (2A).
-	return nil
+	return l.entries[l.applied:l.committed]
 }
 
 // LastIndex return the last index of the log entries
@@ -94,5 +105,80 @@ func (l *RaftLog) LastIndex() uint64 {
 // Term return the term of the entry in the given index
 func (l *RaftLog) Term(i uint64) (uint64, error) {
 	// Your Code Here (2A).
-	return 0, nil
+	if i == 0 {
+		return 0, nil
+	}
+	if int(i) > len(l.entries) {
+		return 0, errors.New("index out of i")
+	}
+	return l.entries[i-1].Term, nil
+}
+
+func (l *RaftLog) tryAppend(m pb.Message) bool {
+	isConflict := false
+	if l.matchTerm(m.Index, m.LogTerm) {
+		// check conflict
+		for _, e := range m.Entries {
+			if !l.checkNoConflict(e) {
+				isConflict = true
+			}
+		}
+		if isConflict {
+			// delete the existing conflict entry and all that follow it
+			l.entries = l.entries[:m.Index]
+			// update(del) entry in storage todo ？
+			l.stabled = m.Index
+			ms := l.storage.(*MemoryStorage)
+			ms.Append(l.entries)
+			// append new log
+			for _, e := range m.Entries {
+				l.entries = append(l.entries, *e)
+			}
+		}
+		lastIndexOfNewEntry := m.Index
+		if len(m.Entries) != 0 {
+			lastIndexOfNewEntry = m.Entries[len(m.Entries)-1].Index
+		}
+		l.committed = min(m.Commit, lastIndexOfNewEntry)
+		return true
+	} else {
+		return false
+	}
+}
+
+// index and term ===  :前面的日志都相同
+func (l *RaftLog) matchTerm(index uint64, logTerm uint64) bool {
+	// no pre log
+	if index == 0 {
+		return true
+	}
+	term, err := l.Term(index)
+	if err != nil {
+		return false
+	}
+	return term == logTerm
+}
+
+func (l *RaftLog) checkNoConflict(e *pb.Entry) bool {
+	term, err := l.Term(e.Index)
+	if err != nil {
+		return false
+	}
+	return term == e.Term
+}
+
+// more up to date
+func (l *RaftLog) moreUpToDate(m pb.Message) bool {
+	// check term
+	term, err := l.Term(l.LastIndex())
+	if err != nil {
+		return false
+	}
+	if term > m.LogTerm {
+		return true
+	} else if term < m.LogTerm {
+		return false
+	}
+	// == check index
+	return l.LastIndex() > m.Index
 }
